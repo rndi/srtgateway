@@ -11,10 +11,16 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	sas "github.com/Azure/azure-amqp-common-go/sas"
+	eventhub "github.com/Azure/azure-event-hubs-go"
 	eventhubs "github.com/Azure/azure-event-hubs-go"
+	"github.com/shirou/gopsutil/process"
 )
 
 type serviceConfiguration struct {
@@ -45,7 +51,72 @@ type channelIO struct {
 	Name       string
 	URL        string
 	Protocol   string
-	Parameters []interface{}
+	Parameters []map[string]string
+}
+
+type containerStatus struct {
+	Health           string          `json:"health"`
+	HealthMessage    string          `json:"health_message"`
+	Channels         []channelStatus `json:"channels"`
+	CPUsage          float64         `json:"cpu_usage"`
+	MemoryUsageRel   float64         `json:"memory_usage_rel"`
+	BandwithUsageIn  uint64          `json:"bandwith_usage_in"`
+	BandwithUsageOut uint64          `json:"bandwith_usage_out"`
+	/*
+		CPUUsageDetailed    []int         `json:"cpu_usage_detailed"`
+		MemoryUsageAbsolute int           `json:"memory_usage_absolut"`
+		MemoryPhy           int           `json:"memory_phy"`
+	*/
+}
+
+type channelStatus struct {
+	Name          string                 `json:"Name"`
+	ID            string                 `json:"id"`
+	Health        string                 `json:"health"`
+	HealthMessage string                 `json:"health_message"`
+	AppData       map[string]interface{} `json:"app_data"`
+	Inputs        []channelIOStatus      `json:"inputs"`
+	Outputs       []channelIOStatus      `json:"outputs"`
+}
+
+type channelIOStatus struct {
+	ID             string         `json:"id"`
+	Name           string         `json:"Name"`
+	Health         string         `json:"health"`
+	HealthMessage  string         `json:"health_message"`
+	URL            string         `json:"url"`
+	Protocol       string         `json:"protocol"`
+	ProtocolStatus protocolStatus `json:"protocol_status"`
+}
+
+type protocolStatus struct {
+	ConnectionState string  `json:"connection_state"`
+	ReconnectCount  int     `json:"reconnect_count"`
+	PayloadBitrate  float64 `json:"payload_bitrate"`
+	/*
+		UsedBandwidth   float64 `json:"used_bandwidth"`
+	*/
+}
+
+type ffmpegProgress struct {
+	frame          int
+	fps            float64
+	bitrate        float64
+	totalSize      int
+	outTimeMS      int
+	dupFrames      int
+	dropFrames     int
+	cpuUsage       float64
+	memoryUsageRel float64
+	bytesSent      uint64
+	bytesRecv      uint64
+}
+
+type serviceContext struct {
+	ctx         context.Context
+	serviceConf serviceConfiguration
+	channelConf channelConfiguration
+	progress    ffmpegProgress
 }
 
 func dropCR(data []byte) []byte {
@@ -56,8 +127,7 @@ func dropCR(data []byte) []byte {
 }
 
 // Custom splitter that accepts line terminated with CR only.
-// This is needed because ffmpeg likes to log stats
-// on a single line (no new line present)
+// This is needed because ffmpeg likes to log stats without adding a new line.
 func scanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	if atEOF && len(data) == 0 {
 		return 0, nil, nil
@@ -89,9 +159,35 @@ func pipeReader(r io.ReadCloser, wantNL bool, ch chan string) {
 	close(ch)
 }
 
-func ffmpegRun(args string) {
-	cmd := exec.Command("ffmpeg", "-progress", "-")
-	cmd.Args = append(cmd.Args, strings.Split(args, " ")...)
+func parseFFmpegProgress(progress *ffmpegProgress, kv []string) {
+	switch kv[0] {
+	case "frame":
+		progress.frame, _ = strconv.Atoi(kv[1])
+	case "fps":
+		progress.fps, _ = strconv.ParseFloat(kv[1], 32)
+		progress.fps = float64(int(progress.fps*100+0.5)) / 100
+	case "bitrate":
+		progress.bitrate, _ = strconv.ParseFloat(
+			strings.TrimRight(kv[1], "kbits/s"), 32)
+		progress.bitrate = float64(int(progress.bitrate*10+0.5)) / 10
+	case "total_size":
+		progress.totalSize, _ = strconv.Atoi(kv[1])
+	case "out_time_ms":
+		progress.outTimeMS, _ = strconv.Atoi(kv[1])
+	case "dup_frames":
+		progress.dupFrames, _ = strconv.Atoi(kv[1])
+	case "drop_frames":
+		progress.dupFrames, _ = strconv.Atoi(kv[1])
+	}
+}
+
+func ffmpegRun(ctx context.Context, args string) <-chan ffmpegProgress {
+	cmd := exec.CommandContext(ctx,
+		"/work/ffmpeg/_install/bin/ffmpeg", "-progress", "-",
+		"-v", "verbose")
+
+	cmd.Args = append(cmd.Args, strings.Fields(args)...)
+	cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH=/work/ffmpeg/_install/lib/")
 	log.Printf("CMD: %v", &cmd.Args)
 
 	// grab stdout and stderr pipes.
@@ -100,41 +196,282 @@ func ffmpegRun(args string) {
 	var err error
 	var stdoutPipe, stderrPipe io.ReadCloser
 	if stdoutPipe, err = cmd.StdoutPipe(); err != nil {
-		log.Fatalf("Failed to connect stdout pipe: %v", err)
+		log.Fatalln("Failed to connect stdout pipe: ", err)
 	}
 	stdoutCh := make(chan string)
 	go pipeReader(stdoutPipe, true, stdoutCh)
 
 	if stderrPipe, err = cmd.StderrPipe(); err != nil {
-		log.Fatalf("Failed to connect stderr pipe: %v", err)
+		log.Fatalln("Failed to connect stderr pipe: ", err)
 	}
 	stderrCh := make(chan string)
 	go pipeReader(stderrPipe, false, stderrCh)
 
 	// start ffmpeg in background
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("Failed to start ffmpeg: %s", err)
+		log.Fatalln("Failed to start ffmpeg: ", err)
 	}
 
-readloop:
-	for {
-		select {
-		case stdout, ok := <-stdoutCh:
-			if !ok {
+	ch := make(chan ffmpegProgress)
+	go func() {
+		var progress ffmpegProgress
+		log.Println("FFmpeg PID", cmd.Process.Pid)
+
+		ticker := time.NewTicker(
+			time.Duration(3) * time.Second)
+		process, err := process.NewProcess(int32(cmd.Process.Pid))
+		if err != nil {
+			log.Println("Failed to find process", cmd.Process.Pid)
+		}
+		var cpuUsagePct, memUsagePct float64
+		var bytesSent, bytesRecv uint64
+		gotProgress := false
+	readloop:
+		for {
+			select {
+			case stdout, ok := <-stdoutCh:
+				if !ok {
+					break readloop
+				}
+				if strings.Contains(stdout, "progress=") {
+					gotProgress = true
+					if progress.frame != 0 {
+						progress.cpuUsage = cpuUsagePct
+						progress.memoryUsageRel = memUsagePct
+						progress.bytesSent = bytesSent
+						progress.bytesRecv = bytesRecv
+						ch <- progress
+					}
+					progress = ffmpegProgress{}
+				} else {
+					if kv := strings.SplitN(stdout, "=", 2); len(kv) == 2 {
+						parseFFmpegProgress(&progress, kv)
+					}
+				}
+			case stderr, ok := <-stderrCh:
+				if !ok {
+					break readloop
+				}
+				log.Println(stderr)
+			case <-ticker.C:
+				if process != nil {
+					cpuUsagePct, err = process.PercentWithContext(ctx, 0)
+					if err == nil {
+						cpuUsagePct = float64(int(cpuUsagePct*10+0.5)) / 10
+					}
+					v, err := process.MemoryPercentWithContext(ctx)
+					if err == nil {
+						memUsagePct = float64(int(v*10+0.5)) / 10
+					}
+					ioCounts, err := process.NetIOCountersWithContext(ctx, false)
+					if err == nil {
+						bytesSent = ioCounts[0].BytesSent
+						bytesRecv = ioCounts[0].BytesRecv
+					}
+					// if we don't have ffmpeg progress report yet,
+					// send out hosts stats anyway
+					if !gotProgress {
+						progress.cpuUsage = cpuUsagePct
+						progress.memoryUsageRel = memUsagePct
+						progress.bytesSent = bytesSent
+						progress.bytesRecv = bytesRecv
+						ch <- progress
+					}
+					if false {
+						log.Println(
+							"CPU", cpuUsagePct,
+							"MEM", memUsagePct,
+							"OUT", bytesSent,
+							"IN", bytesRecv)
+					}
+				}
+			case <-ctx.Done():
 				break readloop
 			}
-			fmt.Printf("LINE: %s\n", stdout)
-		case stderr, ok := <-stderrCh:
-			if !ok {
-				break readloop
+		}
+		log.Println("waiting for ffmpeg to exit...")
+		err = cmd.Wait()
+		log.Printf("ffmpeg exited with error: %v", err)
+
+		close(ch)
+	}()
+
+	return ch
+}
+
+func createStatusReport(serviceConf *serviceConfiguration,
+	channelConf *channelConfiguration,
+	progress *ffmpegProgress, restartCount int) ([]byte, error) {
+
+	var status containerStatus
+	status.Health = "ok"
+	status.CPUsage = progress.cpuUsage
+	status.MemoryUsageRel = progress.memoryUsageRel
+	status.BandwithUsageIn = progress.bytesRecv
+	status.BandwithUsageOut = progress.bytesSent
+
+	status.Channels = make([]channelStatus, 1)
+	ch := &status.Channels[0]
+	ch.Name = channelConf.ChannelName
+	ch.ID = channelConf.ChannelID
+	ch.Health = "ok"
+	ch.AppData = channelConf.AppData
+
+	ch.Inputs = make([]channelIOStatus, 1)
+	in := &ch.Inputs[0]
+	in.ID = channelConf.Inputs[0].ID
+	in.Name = channelConf.Inputs[0].Name
+	in.Health = "ok"
+	in.URL = channelConf.Inputs[0].URL
+	in.Protocol = channelConf.Inputs[0].Protocol
+	switch {
+	case progress.frame > 0:
+		in.ProtocolStatus.ConnectionState = "connected"
+	default:
+		in.ProtocolStatus.ConnectionState = "disconnected"
+	}
+	in.ProtocolStatus.ReconnectCount = restartCount
+
+	ch.Outputs = make([]channelIOStatus, 1)
+	out := &ch.Outputs[0]
+	out.ID = channelConf.Outputs[0].ID
+	out.Name = channelConf.Outputs[0].Name
+	out.Health = "ok"
+	out.URL = channelConf.Outputs[0].URL
+	out.Protocol = channelConf.Outputs[0].Protocol
+	switch {
+	case progress.frame > 0:
+		out.ProtocolStatus.ConnectionState = "connected"
+	default:
+		out.ProtocolStatus.ConnectionState = "disconnected"
+	}
+
+	out.ProtocolStatus.PayloadBitrate = progress.bitrate
+	out.ProtocolStatus.ReconnectCount = restartCount
+
+	return json.Marshal(status)
+}
+
+func parseSRTParameters(b *bytes.Buffer, ps *[]map[string]string) {
+	for _, p := range *ps {
+		k := p["name"]
+		v := p["value"]
+
+		if len(v) == 0 {
+			continue
+		}
+
+		switch k {
+		case "srt_mode":
+			b.WriteString(" -mode ")
+			b.WriteString(v)
+		case "srt_encryption":
+			var l string
+			switch v {
+			case "AES128":
+				l = "16"
+			case "AES192":
+				l = "24"
+			case "AES256":
+				l = "32"
 			}
-			log.Println(stderr)
+			if len(l) != 0 {
+				b.WriteString(" -pbkeylen ")
+				b.WriteString(l)
+			}
+		case "srt_passphrase":
+			b.WriteString(" -passphrase ")
+			b.WriteString(v)
+		case "srt_latency":
+			b.WriteString(" -latency ")
+			b.WriteString(v)
+		case "srt_mss":
+			b.WriteString(" -mss ")
+			b.WriteString(v)
+		case "srt_overheadbw":
+			b.WriteString(" -oheadbw ")
+			b.WriteString(v)
+		case "srt_maxbw":
+			b.WriteString(" -maxbw ")
+			b.WriteString(v)
 		}
 	}
-	log.Println("waiting for ffmpeg to exit...")
-	err = cmd.Wait()
+}
 
-	log.Printf("ffmpeg existed with error: %v", err)
+func createFFmpegInvocation(channelConf *channelConfiguration) string {
+	var b bytes.Buffer
+
+	input := &channelConf.Inputs[0]
+	output := &channelConf.Outputs[0]
+
+	if true {
+		log.Printf("INPUT '%s', ID '%s', URL '%s'",
+			input.Name, input.ID, input.URL)
+		log.Printf("OUTPUT '%s', ID '%s', URL '%s'",
+			output.Name, output.ID, output.URL)
+	}
+
+	convertAudio := false
+	var format string
+	switch output.Protocol {
+	case "srt":
+		format = "mpegts"
+	case "rtmp":
+		convertAudio = true
+		format = "flv"
+	case "rtmps":
+		convertAudio = true
+		format = "flv"
+	case "udp":
+		format = "mpegts"
+	case "rtp":
+		format = "rtp"
+	case "rtsp":
+		format = "rtsp"
+		/*
+			case "hls":
+				format = "mpegts"
+			case "dash":
+				format = "mpegts"
+		*/
+	default:
+		log.Fatal("Unsuported output protocol", output.Protocol)
+	}
+
+	switch input.Protocol {
+	case "srt":
+		parseSRTParameters(&b, &input.Parameters)
+	case "rtmp":
+		convertAudio = false
+	case "rtmps":
+		convertAudio = false
+	case "udp":
+	case "rtp":
+	case "rtsp":
+	case "hls":
+	case "dash":
+	default:
+		log.Fatal("Unsuported input protocol", input.Protocol)
+	}
+
+	b.WriteString(" -i ")
+	b.WriteString(input.URL)
+
+	if convertAudio {
+		b.WriteString(" -c:a aac -b:a 128k -ar 44100 -c:v copy ")
+	} else {
+		b.WriteString(" -codec copy ")
+	}
+	if output.Protocol == "srt" {
+		parseSRTParameters(&b, &output.Parameters)
+	}
+
+	b.WriteString(" -f ")
+	b.WriteString(format)
+	b.WriteString(" ")
+	b.WriteString(output.URL)
+
+	return b.String()
 }
 
 func main() {
@@ -154,9 +491,9 @@ func main() {
 
 	var serviceConf serviceConfiguration
 	if err := json.Unmarshal([]byte(serviceConfJSON), &serviceConf); err != nil {
-		log.Fatalf("Error decoding service configuration: %s", err)
+		log.Fatalln("Error decoding service configuration: ", err)
 	}
-	fmt.Println(serviceConf)
+
 	// Get channel configuration
 	channelConfJSON, ok := os.LookupEnv("CHANNELCONF")
 	if !ok {
@@ -168,7 +505,7 @@ func main() {
 
 	var channelConf channelConfiguration
 	if err := json.Unmarshal([]byte(channelConfJSON), &channelConf); err != nil {
-		log.Fatalf("Error decoding service configuration: %s", err)
+		log.Fatalln("Error decoding service configuration: ", err)
 	}
 
 	// Create eventhub object
@@ -176,7 +513,7 @@ func main() {
 		serviceConf.EventHubConnection.SharedAccessPolicy,
 		serviceConf.EventHubConnection.SharedAccessKey))
 	if err != nil {
-		log.Fatalf("Failed to create token provider: %s\n", err)
+		log.Fatalln("Failed to create token provider: ", err)
 	}
 
 	hub, err := eventhubs.NewHub(
@@ -186,19 +523,19 @@ func main() {
 	ctx := context.Background()
 	defer hub.Close(ctx)
 	if err != nil {
-		log.Fatalf("Failed to create hub object: %v\n", err)
+		log.Fatalln("Failed to create hub object: ", err)
 	}
 
 	// Test eventhub object
-	if false {
+	if true {
 		info, err := hub.GetRuntimeInformation(ctx)
 		if err != nil {
-			log.Fatalf("Failed to get runtime info: %s\n", err)
+			log.Fatalln("Failed to get runtime info: ", err)
 		}
-		log.Printf("Got partition IDs: %s\n", info.PartitionIDs)
+		log.Println("Got partition IDs: ", info.PartitionIDs)
 		if err := hub.Send(ctx,
 			eventhubs.NewEventFromString("hello Azure!")); err != nil {
-			log.Fatalf("Failed to send test event: %s\n", err)
+			log.Fatalln("Failed to send test event: ", err)
 		}
 	}
 
@@ -216,20 +553,84 @@ func main() {
 			"WARNING: Only first input out of %d will be used\n", numInputs)
 	}
 
-	input := &channelConf.Inputs[0]
-	log.Printf("INPUT '%s', ID '%s', URL '%s'",
-		input.Name, input.ID, input.URL)
-
 	numOutputs := len(channelConf.Outputs)
 	if numOutputs == 0 {
 		log.Fatalln("No outputs specified, abort")
 	}
 
-	for i := 0; i < numOutputs; i++ {
-		output := &channelConf.Outputs[i]
-		log.Printf("OUTPUT '%s', ID '%s', URL '%s'",
-			output.Name, output.ID, output.URL)
+	if numOutputs != 1 {
+		log.Printf(
+			"WARNING: Only first output out of %d will be used\n", numOutputs)
 	}
 
-	ffmpegRun("-i udp://239.42.42.42:4242 -f mpegts udp://239.42.42.42:4243")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var chProgress <-chan ffmpegProgress
+	var progress ffmpegProgress
+	needRestart := true
+	restartCount := 0
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+
+	ticker := &time.Ticker{}
+	if serviceConf.TelemetryFrequency > 0 {
+		ticker = time.NewTicker(
+			time.Duration(serviceConf.TelemetryFrequency) * time.Second)
+	}
+	for ctx.Err() == nil {
+		if needRestart {
+			s := createFFmpegInvocation(&channelConf)
+			chProgress = ffmpegRun(ctx, s)
+			needRestart = false
+		}
+
+		select {
+		case progress, ok = <-chProgress:
+			if !ok {
+				// throttle restart
+				time.Sleep(1 * time.Second)
+				needRestart = true
+				restartCount++
+				break
+			}
+		case <-ticker.C:
+			r, err := createStatusReport(&serviceConf, &channelConf,
+				&progress, restartCount)
+			if err != nil {
+				log.Println("Error creating status report:", err)
+			} else {
+				e := eventhub.NewEvent(r)
+				e.Set("componentType", "container")
+				e.Set("componentId", serviceConf.ContainerID)
+				err = hub.Send(ctx, e)
+				if err != nil {
+					log.Println("WARNING: Failed to send event", err)
+				}
+			}
+		case s := <-signals:
+			log.Println("Caught", s)
+			if s == syscall.SIGUSR1 {
+				r, err := createStatusReport(&serviceConf, &channelConf,
+					&progress, restartCount)
+				if err != nil {
+					log.Println("Error creating status report:", err)
+				} else {
+					fmt.Println(string(r))
+				}
+			} else {
+				cancel()
+			}
+		}
+	}
+	log.Println("Waiting for processes to terminate...")
+	select {
+	case _, ok = <-chProgress:
+		if !ok {
+			log.Println("...Done!")
+		}
+	case <-time.After(5 * time.Second):
+		log.Println("...Timed out")
+	}
 }
