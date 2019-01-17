@@ -181,12 +181,12 @@ func parseFFmpegProgress(progress *ffmpegProgress, kv []string) {
 	}
 }
 
-func ffmpegRun(ctx context.Context, args string) <-chan ffmpegProgress {
+func ffmpegRun(ctx context.Context, args []string) <-chan ffmpegProgress {
 	cmd := exec.CommandContext(ctx,
 		"/work/ffmpeg/_install/bin/ffmpeg", "-progress", "-",
 		"-v", "verbose")
 
-	cmd.Args = append(cmd.Args, strings.Fields(args)...)
+	cmd.Args = append(cmd.Args, args...)
 	cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH=/work/ffmpeg/_install/lib/")
 	log.Printf("CMD: %v", &cmd.Args)
 
@@ -352,7 +352,7 @@ func createStatusReport(serviceConf *serviceConfiguration,
 	return json.Marshal(status)
 }
 
-func parseSRTParameters(b *bytes.Buffer, ps *[]map[string]string) {
+func parseSRTParameters(b *[]string, ps *[]map[string]string) {
 	for _, p := range *ps {
 		k := p["name"]
 		v := p["value"]
@@ -363,8 +363,8 @@ func parseSRTParameters(b *bytes.Buffer, ps *[]map[string]string) {
 
 		switch k {
 		case "srt_mode":
-			b.WriteString(" -mode ")
-			b.WriteString(v)
+			*b = append(*b, "-mode")
+			*b = append(*b, v)
 		case "srt_encryption":
 			var l string
 			switch v {
@@ -376,30 +376,30 @@ func parseSRTParameters(b *bytes.Buffer, ps *[]map[string]string) {
 				l = "32"
 			}
 			if len(l) != 0 {
-				b.WriteString(" -pbkeylen ")
-				b.WriteString(l)
+				*b = append(*b, "-pbkeylen")
+				*b = append(*b, l)
 			}
 		case "srt_passphrase":
-			b.WriteString(" -passphrase ")
-			b.WriteString(v)
+			*b = append(*b, "-passphrase")
+			*b = append(*b, v)
 		case "srt_latency":
-			b.WriteString(" -latency ")
-			b.WriteString(v)
+			*b = append(*b, "-latency")
+			*b = append(*b, v)
 		case "srt_mss":
-			b.WriteString(" -mss ")
-			b.WriteString(v)
+			*b = append(*b, "-mss")
+			*b = append(*b, v)
 		case "srt_overheadbw":
-			b.WriteString(" -oheadbw ")
-			b.WriteString(v)
+			*b = append(*b, "-oheadbw")
+			*b = append(*b, v)
 		case "srt_maxbw":
-			b.WriteString(" -maxbw ")
-			b.WriteString(v)
+			*b = append(*b, "-maxbw")
+			*b = append(*b, v)
 		}
 	}
 }
 
-func createFFmpegInvocation(channelConf *channelConfiguration) string {
-	var b bytes.Buffer
+func createFFmpegInvocation(channelConf *channelConfiguration) []string {
+	b := make([]string, 0, 100)
 
 	input := &channelConf.Inputs[0]
 	output := &channelConf.Outputs[0]
@@ -435,7 +435,7 @@ func createFFmpegInvocation(channelConf *channelConfiguration) string {
 				format = "mpegts"
 		*/
 	default:
-		log.Fatal("Unsuported output protocol", output.Protocol)
+		log.Fatal("Unsupported output protocol", output.Protocol)
 	}
 
 	switch input.Protocol {
@@ -451,27 +451,35 @@ func createFFmpegInvocation(channelConf *channelConfiguration) string {
 	case "hls":
 	case "dash":
 	default:
-		log.Fatal("Unsuported input protocol", input.Protocol)
+		log.Fatal("Unsupported input protocol", input.Protocol)
 	}
 
-	b.WriteString(" -i ")
-	b.WriteString(input.URL)
+	b = append(b, "-i")
+	b = append(b, input.URL)
 
 	if convertAudio {
-		b.WriteString(" -c:a aac -b:a 128k -ar 44100 -c:v copy ")
+		b = append(b, strings.Fields(
+			"-c:a aac -b:a 128k -ar 44100 -c:v copy")...)
 	} else {
-		b.WriteString(" -codec copy ")
+		b = append(b, strings.Fields(
+			"-codec copy")...)
 	}
-	if output.Protocol == "srt" {
+	switch output.Protocol {
+	case "srt":
 		parseSRTParameters(&b, &output.Parameters)
+	case "udp":
+		// workaround ffmpeg sending out huge UDP packets
+		if true {
+			b = append(b, "-pkt_size")
+			b = append(b, "1316")
+		}
 	}
 
-	b.WriteString(" -f ")
-	b.WriteString(format)
-	b.WriteString(" ")
-	b.WriteString(output.URL)
+	b = append(b, "-f")
+	b = append(b, format)
+	b = append(b, output.URL)
 
-	return b.String()
+	return b
 }
 
 func main() {
