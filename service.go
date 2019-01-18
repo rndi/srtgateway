@@ -18,7 +18,6 @@ import (
 	"time"
 
 	sas "github.com/Azure/azure-amqp-common-go/sas"
-	eventhub "github.com/Azure/azure-event-hubs-go"
 	eventhubs "github.com/Azure/azure-event-hubs-go"
 	"github.com/shirou/gopsutil/process"
 )
@@ -183,7 +182,7 @@ func parseFFmpegProgress(progress *ffmpegProgress, kv []string) {
 
 func ffmpegRun(ctx context.Context, args []string) <-chan ffmpegProgress {
 	cmd := exec.CommandContext(ctx,
-		"/work/ffmpeg/_install/bin/ffmpeg", "-progress", "-",
+		/* "/work/ffmpeg/_install/bin/ffmpeg" */ "ffmpeg", "-progress", "-",
 		"-v", "verbose")
 
 	cmd.Args = append(cmd.Args, args...)
@@ -609,7 +608,7 @@ func main() {
 			if err != nil {
 				log.Println("Error creating status report:", err)
 			} else {
-				e := eventhub.NewEvent(r)
+				e := eventhubs.NewEvent(r)
 				e.Set("componentType", "container")
 				e.Set("componentId", serviceConf.ContainerID)
 				err = hub.Send(ctx, e)
