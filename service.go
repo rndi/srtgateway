@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -488,7 +489,7 @@ func main() {
 	flag.Parse()
 
 	// Get service configuration
-	serviceConfJSON, ok := os.LookupEnv("SERVICECONF")
+	serviceConfJSON, ok := os.LookupEnv("CONTAINER_CONFIG")
 	if !ok {
 		log.Fatalln("Service configuration is not set")
 	}
@@ -502,7 +503,7 @@ func main() {
 	}
 
 	// Get channel configuration
-	channelConfJSON, ok := os.LookupEnv("CHANNELCONF")
+	channelConfJSON, ok := os.LookupEnv("APP_CONFIG")
 	if !ok {
 		log.Fatalln("Channel configuration is not set")
 	}
@@ -625,6 +626,10 @@ func main() {
 					log.Println("Error creating status report:", err)
 				} else {
 					fmt.Println(string(r))
+					err = ioutil.WriteFile("/tmp/haivision/service_status", r, 0644)
+					if err != nil {
+						log.Println("Error writing status report:", err)
+					}
 				}
 			} else {
 				cancel()
