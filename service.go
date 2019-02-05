@@ -23,6 +23,10 @@ import (
 	"github.com/shirou/gopsutil/process"
 )
 
+const ffmpegPath string = "ffmpeg"
+const ffmpegEnv string = ""
+const serviceStatusFilePath string = "/tmp/haivision/service_status"
+
 type serviceConfiguration struct {
 	ConfigurationBlobLocation string
 	EventHubConnection        eventHubConfiguration
@@ -80,13 +84,13 @@ type channelStatus struct {
 }
 
 type channelIOStatus struct {
-	ID             string         `json:"id"`
-	Name           string         `json:"Name"`
-	Health         string         `json:"health"`
-	HealthMessage  string         `json:"health_message"`
-	URL            string         `json:"url"`
-	Protocol       string         `json:"protocol"`
-	ProtocolStatus protocolStatus `json:"protocol_status"`
+	ID             string           `json:"id"`
+	Name           string           `json:"Name"`
+	Health         string           `json:"health"`
+	HealthMessage  string           `json:"health_message"`
+	URL            string           `json:"url"`
+	Protocol       string           `json:"protocol"`
+	ProtocolStatus []protocolStatus `json:"protocol_status"`
 }
 
 type protocolStatus struct {
@@ -183,11 +187,13 @@ func parseFFmpegProgress(progress *ffmpegProgress, kv []string) {
 
 func ffmpegRun(ctx context.Context, args []string) <-chan ffmpegProgress {
 	cmd := exec.CommandContext(ctx,
-		/* "/work/ffmpeg/_install/bin/ffmpeg" */ "ffmpeg", "-progress", "-",
+		ffmpegPath, "-progress", "-",
 		"-v", "verbose")
 
 	cmd.Args = append(cmd.Args, args...)
-	cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH=/work/ffmpeg/_install/lib/")
+	if len(ffmpegEnv) > 0 {
+		cmd.Env = append(cmd.Env, ffmpegEnv)
+	}
 	log.Printf("CMD: %v", &cmd.Args)
 
 	// grab stdout and stderr pipes.
@@ -324,13 +330,14 @@ func createStatusReport(serviceConf *serviceConfiguration,
 	in.Health = "ok"
 	in.URL = channelConf.Inputs[0].URL
 	in.Protocol = channelConf.Inputs[0].Protocol
+	in.ProtocolStatus = make([]protocolStatus, 1)
 	switch {
 	case progress.frame > 0:
-		in.ProtocolStatus.ConnectionState = "connected"
+		in.ProtocolStatus[0].ConnectionState = "connected"
 	default:
-		in.ProtocolStatus.ConnectionState = "disconnected"
+		in.ProtocolStatus[0].ConnectionState = "disconnected"
 	}
-	in.ProtocolStatus.ReconnectCount = restartCount
+	in.ProtocolStatus[0].ReconnectCount = restartCount
 
 	ch.Outputs = make([]channelIOStatus, 1)
 	out := &ch.Outputs[0]
@@ -339,15 +346,16 @@ func createStatusReport(serviceConf *serviceConfiguration,
 	out.Health = "ok"
 	out.URL = channelConf.Outputs[0].URL
 	out.Protocol = channelConf.Outputs[0].Protocol
+	out.ProtocolStatus = make([]protocolStatus, 1)
 	switch {
 	case progress.frame > 0:
-		out.ProtocolStatus.ConnectionState = "connected"
+		out.ProtocolStatus[0].ConnectionState = "connected"
 	default:
-		out.ProtocolStatus.ConnectionState = "disconnected"
+		out.ProtocolStatus[0].ConnectionState = "disconnected"
 	}
 
-	out.ProtocolStatus.PayloadBitrate = progress.bitrate
-	out.ProtocolStatus.ReconnectCount = restartCount
+	out.ProtocolStatus[0].PayloadBitrate = progress.bitrate
+	out.ProtocolStatus[0].ReconnectCount = restartCount
 
 	return json.Marshal(status)
 }
@@ -626,7 +634,7 @@ func main() {
 					log.Println("Error creating status report:", err)
 				} else {
 					fmt.Println(string(r))
-					err = ioutil.WriteFile("/tmp/haivision/service_status", r, 0644)
+					err = ioutil.WriteFile(serviceStatusFilePath, r, 0644)
 					if err != nil {
 						log.Println("Error writing status report:", err)
 					}
